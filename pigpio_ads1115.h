@@ -9,6 +9,7 @@
 #define pigpio_ads1115_h
 
 #include <pigpio.h>
+#include <stdexcept>
 
 /// The default raw difference for the low threshold, when not specified in continous conversion mode (startComparatorMode_SingleEnded)
 #define DEFAULT_LOW_THRESHOLD_DIFF 5
@@ -246,6 +247,12 @@ private:
 
     /** The queue and disable bits */
     uint16_t comparatorAssertConfig;
+
+    /** The bus of the I2C connection where this sensor is located */
+    uint8_t i2cBus;
+
+    /** The handle for the I2C connections. -1 if not set or missing */
+    int i2cHandle;
     
     // MARK: Nested enums
 
@@ -309,16 +316,16 @@ private:
      */
     int16_t currentConfigSingleShotRead() {
         writeCurrentConfig();
-        unsigned long readingDelay = delayForChannelReading();
+        auto readingDelay = delayForChannelReading();
         time_sleep(readingDelay); // TODO: Check if this works in multithreaded environments
 
-        return readFromAds(address, (uint8_t)AddressPointerReg::conversionRegister);
+        return readFromAds(address, (uint8_t)AddressPointerReg::conversionRegister, i2cBus, i2cHandle);
     }
     
-    /** Writes the [currentConfigRegister] to the ads */
+    /** Writes the [currentConfigRegister] to the ads */ 
     void writeCurrentConfig() {
         uint16_t configRegister = buildConfigRegister();
-        writeToAds(address, (uint8_t)AddressPointerReg::configRegister, configRegister);
+        writeToAds(address, (uint8_t)AddressPointerReg::configRegister, configRegister, i2cBus, i2cHandle);
     }
     
     /** Returns the mux config of the given [channel] */
@@ -347,12 +354,12 @@ private:
      * @param reg The [AddressPointer] register to which the value will be writen
      * @param value the data to be written (note this is a 16 bit value written in batches of 8)
      */
-    static void writeToAds(uint8_t i2cAddress, uint8_t reg, uint16_t value, uint8_t bus = 0) {
-        auto handle = i2cOpen(bus, i2cAddress, 0);
-        i2cWriteByte(handle, reg);
-        i2cWriteByte(handle, value >> 8);
-        i2cWriteByte(handle, value & 0xFF);
-        i2cClose(handle);
+    static void writeToAds(uint8_t i2cAddress, uint8_t reg, uint16_t value, uint8_t bus, int handle) {
+        if (handle < 0) {
+            throw std::invalid_argument("A connection must first be established, before sending data to the ADS");
+        }
+        auto data = flipWordBytes(value);
+        i2cWriteWordData(handle, reg, data);
     }
     
     /**
@@ -363,14 +370,29 @@ private:
      * @param bus The I2C of the raspberry pi from which the measurement is requested
      * @return The two bytes read from the Ads as a uint16
      */
-    static int16_t readFromAds(uint8_t i2cAddress, uint8_t reg, uint8_t bus = 0) {
-        auto handle = i2cOpen(bus, i2cAddress, 0);
-        i2cWriteByte(handle, reg);
-        uint8_t upperByte = i2cReadByte(handle);
-        uint8_t lowerByte = i2cReadByte(handle);
-        i2cClose(handle);
-        return (upperByte << 8) | lowerByte;
+    static int16_t readFromAds(uint8_t i2cAddress, uint8_t reg, uint8_t bus, int handle) {
+        if (handle < 0) {
+            throw std::invalid_argument("A connection must first be established, before reading data from the ADS");
+        }
+
+        auto rawData = i2cReadWordData(handle, reg);
+        return flipWordBytes(rawData);
     }
+
+    /**
+     * @brief Switches the positions of the bytes in the [word]. The least significant byte
+     * becomes the most significant one and viceversa.
+     * 
+     * @param word The 2 byte integer whose bytes are to be flipped
+     * @return uint16_t The word with the flipped bytes
+     */
+    static uint16_t flipWordBytes(uint16_t word) {
+        auto upperByte = (word >> 8) & 0xFF;
+        auto lowerByte = word & 0xFF;
+
+        return (lowerByte << 8) | upperByte;
+    }
+
     
 public:
     
@@ -380,9 +402,10 @@ public:
      * - address = AdsAddres::gnd
      * - gain = AdsGain::twoThirds +/- 6.144v
      * - dataRate = AdsDataRate::sps64 (64 samples per second, which is sufficiently fast and stable)
+     * @param autoStart Initiates the I2C connection in the constructor (if true), else use begin() to start the connection.
      */
-    PigpioAds1115(AdsAddress adsAddress = AdsAddress::gnd, AdsGain adsGain = AdsGain::twoThirds, AdsSampleSpeed dataRate = AdsSampleSpeed::sps64) :
-    address((uint8_t)adsAddress), gain((uint16_t)adsGain), sampleSpeed((uint16_t)dataRate) {
+    PigpioAds1115(AdsAddress adsAddress = AdsAddress::gnd, AdsGain adsGain = AdsGain::twoThirds, AdsSampleSpeed dataRate = AdsSampleSpeed::sps64, uint8_t bus = 1, bool autoStart = true) :
+    address((uint8_t)adsAddress), gain((uint16_t)adsGain), sampleSpeed((uint16_t)dataRate), i2cBus(bus), i2cHandle(-1) {
         
         // Set up the default config register values
         comparatorAssertConfig = (uint16_t) ComparatorAssertConfig::disableAndSetHighImpedance;
@@ -392,10 +415,37 @@ public:
         adsMode = (uint16_t)AdsModeConfig::singleShotConversion;
         muxConfig = (uint16_t) MuxConfig::channel0;
         osConfig = (uint16_t)OsConfig::startSingleConversion;
-        
-        // Do we need an equivalent of Wire.begin()?!
+
+        if (autoStart) {
+            startI2C();
+        }
+    }
+
+    ~PigpioAds1115() {
+        stopI2C();
     }
     
+    // MARK: I2C management
+
+    /** 
+     * Tries to open the I2C communication with the device using the current state
+     * Sets the [handle] value if successfull, else throws an exception
+     */
+    void startI2C() {
+        auto handle = i2cOpen(i2cBus, address, 0);
+        if (handle < 0) {
+            throw std::runtime_error("Cannot connect to ADS!");
+        } else {
+            i2cHandle = handle;
+        }
+    }
+
+    void stopI2C() {
+        if (i2cHandle >= 0) {
+            i2cClose(i2cHandle);
+            i2cHandle = -1;
+        }
+    }
     
     
     // MARK: Single shot reading
