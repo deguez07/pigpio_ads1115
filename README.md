@@ -3,5 +3,7 @@
 This library provides access to the ADS1115 16-bit ADC converter. It works over the **pigpio** library, make sure it is installed
 
 ## PENDING
-- Test first version works as implemented 
 - Implement comparator mode
+
+## Notes
+First version has been successfully tested! Let me know if you find any issues.
